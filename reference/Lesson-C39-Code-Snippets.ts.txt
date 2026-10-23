@@ -1,0 +1,58 @@
+// Slack-specific verification. Not a Teams/email verifier or deployed endpoint.
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { z } from "zod";
+import type Anthropic from "@anthropic-ai/sdk";
+const Payload = z.object({ team: z.object({ id: z.string() }), user: z.object({ id: z.string() }),
+  actions: z.array(z.object({ action_id: z.enum(["allow", "deny"]), value: z.string().regex(/^[a-f0-9]{64}$/) })).length(1) });
+export function verifySlack(raw: string, timestamp: string, signature: string, secret: string, nowSeconds: number) {
+  if (!secret || !/^\d+$/.test(timestamp) || !/^v0=[a-f0-9]{64}$/.test(signature)) return false;
+  if (!Number.isSafeInteger(Number(timestamp)) || Math.abs(nowSeconds - Number(timestamp)) > 300) return false;
+  const expected = "v0=" + createHmac("sha256", secret).update(`v0:${timestamp}:${raw}`).digest("hex");
+  return timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+}
+export type Approval = { sessionId: string; eventId: string; actionHash: string; workspaceId: string;
+  approverId: string; expiresAt: number; state: "pending" | "queued" | "sent" | "uncertain" };
+export type Job = { tokenHash: string; sessionId: string; eventId: string; decision: "allow" | "deny" };
+export const tokenHash = (token: string) => createHash("sha256").update(token).digest("hex");
+export const newToken = () => randomBytes(32).toString("hex");
+// Local teaching store; production uses a durable atomic record+outbox transaction.
+export const records = new Map<string, Approval>();
+export const outbox: Job[] = [];
+export function receiveSlack(raw: string, timestamp: string, signature: string, secret: string,
+  nowSeconds: number, currentPendingAction: (sessionId: string, eventId: string, hash: string) => boolean) {
+  if (!verifySlack(raw, timestamp, signature, secret, nowSeconds)) throw new Error("Invalid signature");
+  const encoded = new URLSearchParams(raw).get("payload");
+  if (!encoded) throw new Error("Missing payload");
+  const payload = Payload.parse(JSON.parse(encoded));
+  const action = payload.actions[0];
+  const digest = tokenHash(action.value);
+  const record = records.get(digest);
+  if (!record || record.state !== "pending" || nowSeconds >= record.expiresAt ||
+      payload.team.id !== record.workspaceId || payload.user.id !== record.approverId)
+    throw new Error("Expired, replayed or unauthorized approval");
+  if (!currentPendingAction(record.sessionId, record.eventId, record.actionHash))
+    throw new Error("Action changed or no longer pending");
+  // No await between check and claim in this single-process example.
+  outbox.push({ tokenHash: digest, sessionId: record.sessionId, eventId: record.eventId,
+    decision: action.action_id });
+  record.state = "queued";
+  return { queued: true }; // Endpoint acknowledges; worker sends separately.
+}
+export async function dispatch(client: Anthropic, job: Job) {
+  const record = records.get(job.tokenHash);
+  if (!record || record.state !== "queued") throw new Error("Not queued");
+  record.state = "uncertain"; // Claim before network; crash/lost receipt needs reconciliation.
+  try {
+    const receipt = await client.beta.sessions.events.send(job.sessionId, { events: [{
+      type: "user.tool_confirmation", tool_use_id: job.eventId, result: job.decision,
+      ...(job.decision === "deny" ? { deny_message: "Rejected by authorized reviewer." } : {})
+    }] }, { maxRetries: 0, timeout: 10000 });
+    record.state = "sent";
+    return receipt;
+  } catch (error) { throw error; }
+}
+// Bind session, tool event ID, reviewed input hash, approver and tenant at capture.
+// Never log raw bearer tokens or store them in audit payloads.
+// Teams needs its own validated identity protocol; email links open an authenticated
+// review UI with explicit CSRF-protected POST, never approval by GET.
+// No outbound Slack/Teams/email message or provider request runs automatically.
