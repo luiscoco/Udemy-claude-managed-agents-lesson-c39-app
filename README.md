@@ -42,30 +42,88 @@ CLAUDE_MANAGED_ENVIRONMENT_ID=your_environment_id
 PORT=3039
 ```
 
-## How the application was developed
+## How the app was build
 
-The browser collects inputs; the Node host validates requests; the lesson implementation produces observable evidence. The architecture page walks through the real source with numbered steps, prerequisite configuration, source filenames and code excerpts.
+### 1. Construct a synthetic signed callback
 
-### Lesson implementation
+The callback binds workspace, reviewer, pending action and decision. A fresh in-memory secret signs a fixed timestamp and raw body using the demo protocol; it is not a real messaging-service credential.
 
-[src/lesson.ts](https://github.com/luiscoco/Udemy-claude-managed-agents-lesson-c39-app/blob/main/src/lesson.ts)
+Source: [src/lesson.ts](src/lesson.ts#L13) · selected statements
 
 ```typescript
-  async run(input) {
+const decision = text(input, "decision");
 
-const decision=text(input,"decision");if(!["allow","deny"].includes(decision))throw new Error("Select allow or deny");
-const {createHmac,timingSafeEqual,randomBytes}=await import("node:crypto");const secret=randomBytes(32),timestamp="1700000000";
-const body=JSON.stringify({workspace:"demo",user:"reviewer",action:"sevt_write",decision});
-const sign=(raw:string)=>createHmac("sha256",secret).update(`v0:${timestamp}:${raw}`).digest();
-const expected=sign(body),received=sign(flag(input,"tampered")?body+"tamper":body);
-const valid=number(input,"ageSeconds")>=0&&number(input,"ageSeconds")<=300&&timingSafeEqual(expected,received);
-return report(valid?"passed":"rejected",valid?"Verified and queued one synthetic decision":"Callback authentication or freshness failed",{outboxJobs:valid?1:0,delivery:"not sent",protocol:"synthetic Slack-style signature",secretLogged:false},["Verify the raw body signature","Enforce the freshness window","Bind reviewer and pending action","Claim a unique local outbox record"]);
+// ... other source statements omitted ...
+const { createHmac, timingSafeEqual, randomBytes } = await import("node:crypto");
 
-  }
-};
+const secret = randomBytes(32),
+  timestamp = "1700000000";
+
+const body = JSON.stringify({
+  workspace: "demo",
+  user: "reviewer",
+  action: "sevt_write",
+  decision,
+});
+
+const sign = (raw: string) =>
+  createHmac("sha256", secret).update(`v0:${timestamp}:${raw}`).digest();
 ```
 
-Read the architecture page for the remaining source excerpts and explanations, including input handling and optional provider behavior. The diagram describes this application, rather than implying that an external integration has been implemented.
+### 2. Verify exact bytes and a freshness window
+
+Tampering changes the signature, and ages outside zero to 300 seconds fail the freshness rule. An accepted callback produces a synthetic outbox count; delivery is not sent and no real messaging channel is contacted.
+
+Source: [src/lesson.ts](src/lesson.ts#L17) · selected statements
+
+```typescript
+const expected = sign(body),
+  received = sign(flag(input, "tampered") ? body + "tamper" : body);
+
+const valid =
+  number(input, "ageSeconds") >= 0 &&
+  number(input, "ageSeconds") <= 300 &&
+  timingSafeEqual(expected, received);
+
+return report(
+  valid ? "passed" : "rejected",
+  valid
+    ? "Verified and queued one synthetic decision"
+    : "Callback authentication or freshness failed",
+  {
+    outboxJobs: valid ? 1 : 0,
+    delivery: "not sent",
+    protocol: "synthetic Slack-style signature",
+    secretLogged: false,
+  },
+  [
+    "Verify the raw body signature",
+    "Enforce the freshness window",
+    "Bind reviewer and pending action",
+    "Claim a unique local outbox record",
+  ],
+);
+```
+
+### Check your understanding
+
+Run **Verify a signed callback** in the application. Compare the result with these scenario expectations:
+
+```json
+{
+  "input": {
+    "decision": "allow",
+    "tampered": false,
+    "ageSeconds": 30
+  },
+  "expectedOutcome": "passed",
+  "checkEvidence": {
+    "outboxJobs": 1
+  }
+}
+```
+
+Then try **Reject a tampered callback**. Its expected outcome is `rejected`; identify the condition or evidence field that explains the difference.
 
 ## Validation
 
